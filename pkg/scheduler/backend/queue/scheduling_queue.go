@@ -1079,6 +1079,7 @@ func isPodUpdated(oldPod, newPod *v1.Pod) bool {
 		p.Status = v1.PodStatus{
 			ResourceClaimStatuses:       pod.Status.ResourceClaimStatuses,
 			ExtendedResourceClaimStatus: pod.Status.ExtendedResourceClaimStatus,
+			NominatedNodeName:           pod.Status.NominatedNodeName,
 		}
 		p.ManagedFields = nil
 		p.Finalizers = nil
@@ -1153,6 +1154,24 @@ func (p *PriorityQueue) Update(ctx context.Context, oldPod, newPod *v1.Pod) {
 			// whether the update may make the pods schedulable.
 			// Plugins have to implement a QueueingHint for Pod/Update event
 			// if the rejection from them could be resolved by updating unscheduled Pods itself.
+			//
+			// If NominatedNodeName is cleared, it's a signal that the pod might be able to be
+			// scheduled somewhere else, so we should always move it to active or backoff queue.
+			if oldPod != nil && oldPod.Status.NominatedNodeName != "" && newPod.Status.NominatedNodeName == "" {
+				if p.backoffQ.isPodBackingoff(pInfo) {
+					if added := p.moveToBackoffQ(logger, pInfo, framework.EventUnscheduledPodUpdate.Label()); added {
+						if p.isPopFromBackoffQEnabled {
+							p.activeQ.broadcast()
+						}
+					}
+				} else {
+					if added := p.moveToActiveQ(logger, pInfo, framework.EventUnscheduledPodUpdate.Label(), false); added {
+						p.activeQ.broadcast()
+					}
+				}
+				return
+			}
+
 			for _, evt := range events {
 				hint := p.isPodWorthRequeuing(logger, pInfo, evt, oldPod, newPod)
 				queue := p.requeuePodWithQueueingStrategy(logger, pInfo, hint, evt.Label())
