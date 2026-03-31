@@ -1148,6 +1148,15 @@ func (p *PriorityQueue) Update(ctx context.Context, oldPod, newPod *v1.Pod) {
 		p.UpdateNominatedPod(logger, oldPod, pInfo.PodInfo)
 		pInfo.PodSignature = p.signPod(ctx, newPod)
 
+		// If the pod nomination was cleared, it's a signal from the preemption framework that the previous
+		// candidate node is no longer valid. We should move it to activeQ to find a new place.
+		if oldPod.Status.NominatedNodeName != "" && newPod.Status.NominatedNodeName == "" {
+			if added := p.moveToActiveQ(logger, pInfo, "PodNominationCleared", false); added {
+				p.activeQ.broadcast()
+			}
+			return
+		}
+
 		if p.isSchedulingQueueHintEnabled {
 			// When unscheduled Pods are updated, we check with QueueingHint
 			// whether the update may make the pods schedulable.

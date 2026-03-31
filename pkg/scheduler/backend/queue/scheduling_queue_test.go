@@ -1387,6 +1387,23 @@ func TestPriorityQueue_Update(t *testing.T) {
 			},
 			schedulingHintsEnablement: []bool{true},
 		},
+		{
+			name:  "clearing NominatedNodeName should move the pod to active queue",
+			wantQ: activeQ,
+			prepareFunc: func(tCtx ktesting.TContext, q *PriorityQueue) (oldPod, newPod *v1.Pod) {
+				preemptionPlugin := "DefaultPreemption"
+				oldPodWithNominatedNodeName := unschedulablePodInfo.Pod.DeepCopy()
+				oldPodWithNominatedNodeName.Status.NominatedNodeName = "node1"
+				pInfo := q.newQueuedPodInfo(tCtx, oldPodWithNominatedNodeName, preemptionPlugin)
+				q.unschedulablePods.addOrUpdate(pInfo, false, preemptionPlugin)
+
+				updatedPod := oldPodWithNominatedNodeName.DeepCopy()
+				updatedPod.Status.NominatedNodeName = ""
+
+				return oldPodWithNominatedNodeName, updatedPod
+			},
+			schedulingHintsEnablement: []bool{false, true},
+		},
 	}
 
 	for _, tt := range tests {
