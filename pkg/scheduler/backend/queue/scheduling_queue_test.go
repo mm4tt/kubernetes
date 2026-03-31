@@ -1313,9 +1313,6 @@ func TestPriorityQueue_Update(t *testing.T) {
 
 				updatedPod := oldPodWithNominatedNodeName.DeepCopy()
 				updatedPod.Status.NominatedNodeName = ""
-				// Move clock by podMaxBackoffDuration, so that pods in the unschedulablePods would pass the backing off,
-				// and the pods will be moved into activeQ.
-				c.Step(q.backoffQ.podMaxBackoffDuration())
 				return oldPodWithNominatedNodeName, updatedPod
 			},
 			schedulingHintsEnablement: []bool{false, true},

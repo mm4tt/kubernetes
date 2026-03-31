@@ -1156,18 +1156,10 @@ func (p *PriorityQueue) Update(ctx context.Context, oldPod, newPod *v1.Pod) {
 			// if the rejection from them could be resolved by updating unscheduled Pods itself.
 			//
 			// If NominatedNodeName is cleared, it's a signal that the pod might be able to be
-			// scheduled somewhere else, so we should always move it to active or backoff queue.
+			// scheduled somewhere else, so we should always move it to active queue.
 			if oldPod != nil && oldPod.Status.NominatedNodeName != "" && newPod.Status.NominatedNodeName == "" {
-				if p.backoffQ.isPodBackingoff(pInfo) {
-					if added := p.moveToBackoffQ(logger, pInfo, framework.EventUnscheduledPodUpdate.Label()); added {
-						if p.isPopFromBackoffQEnabled {
-							p.activeQ.broadcast()
-						}
-					}
-				} else {
-					if added := p.moveToActiveQ(logger, pInfo, framework.EventUnscheduledPodUpdate.Label(), false); added {
-						p.activeQ.broadcast()
-					}
+				if added := p.moveToActiveQ(logger, pInfo, framework.EventUnscheduledPodUpdate.Label(), false); added {
+					p.activeQ.broadcast()
 				}
 				return
 			}
@@ -1185,6 +1177,14 @@ func (p *PriorityQueue) Update(ctx context.Context, oldPod, newPod *v1.Pod) {
 			}
 			return
 		}
+
+		if oldPod != nil && oldPod.Status.NominatedNodeName != "" && newPod.Status.NominatedNodeName == "" {
+			if added := p.moveToActiveQ(logger, pInfo, framework.EventUnscheduledPodUpdate.Label(), false); added {
+				p.activeQ.broadcast()
+			}
+			return
+		}
+
 		if isPodUpdated(oldPod, newPod) {
 			// Pod might have completed its backoff time while being in unschedulablePods,
 			// so we should check isPodBackingoff before moving the pod to backoffQ.
