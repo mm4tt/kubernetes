@@ -5218,3 +5218,150 @@ func TestPriorityQueue_MultipleProfiles(t *testing.T) {
 		t.Errorf("Pod3: expected nil signature (no signer), got '%s'", string(pInfo3.PodSignature))
 	}
 }
+
+func TestPriorityQueue_Requeue(t *testing.T) {
+	mustNewPodInfo := func(pod *v1.Pod) *framework.PodInfo {
+		pi, _ := framework.NewPodInfo(pod)
+		return pi
+	}
+	metrics.Register()
+	tests := []struct {
+		name                        string
+		qPodInfoInUnschedulablePods []*framework.QueuedPodInfo
+		qPodInfoInBackoffQ          []*framework.QueuedPodInfo
+		qPodInActiveQ               []*v1.Pod
+		qPodsToRequeue              []*v1.Pod
+		wantActive                  int
+		wantBackoff                 int
+		wantUnschedulable           int
+	}{
+		{
+			name: "pod in unschedulablePods, not backing off",
+			qPodInfoInUnschedulablePods: []*framework.QueuedPodInfo{
+				{
+					PodInfo:            mustNewPodInfo(st.MakePod().Name("p1").UID("p1").Obj()),
+					Timestamp:          time.Now().Add(-10 * time.Second),
+					UnschedulableCount: 1, // 1s backoff, so it should be expired
+				},
+			},
+			qPodsToRequeue:    []*v1.Pod{st.MakePod().Name("p1").UID("p1").Obj()},
+			wantActive:        1,
+			wantBackoff:       0,
+			wantUnschedulable: 0,
+		},
+		{
+			name: "pod in unschedulablePods, backing off",
+			qPodInfoInUnschedulablePods: []*framework.QueuedPodInfo{
+				{
+					PodInfo:            mustNewPodInfo(st.MakePod().Name("p2").UID("p2").Obj()),
+					Timestamp:          time.Now(),
+					UnschedulableCount: 1, // 1s backoff, not expired
+				},
+			},
+			qPodsToRequeue:    []*v1.Pod{st.MakePod().Name("p2").UID("p2").Obj()},
+			wantActive:        0,
+			wantBackoff:       1,
+			wantUnschedulable: 0,
+		},
+		{
+			name: "pod in backoffQ, not backing off",
+			qPodInfoInBackoffQ: []*framework.QueuedPodInfo{
+				{
+					PodInfo:            mustNewPodInfo(st.MakePod().Name("p3").UID("p3").Obj()),
+					Timestamp:          time.Now().Add(-10 * time.Second),
+					UnschedulableCount: 1,
+				},
+			},
+			qPodsToRequeue:    []*v1.Pod{st.MakePod().Name("p3").UID("p3").Obj()},
+			wantActive:        1,
+			wantBackoff:       0,
+			wantUnschedulable: 0,
+		},
+		{
+			name: "pod in backoffQ, backing off",
+			qPodInfoInBackoffQ: []*framework.QueuedPodInfo{
+				{
+					PodInfo:            mustNewPodInfo(st.MakePod().Name("p4").UID("p4").Obj()),
+					Timestamp:          time.Now(),
+					UnschedulableCount: 1,
+				},
+			},
+			qPodsToRequeue:    []*v1.Pod{st.MakePod().Name("p4").UID("p4").Obj()},
+			wantActive:        0,
+			wantBackoff:       1,
+			wantUnschedulable: 0,
+		},
+		{
+			name:              "pod not in any queue",
+			qPodsToRequeue:    []*v1.Pod{st.MakePod().Name("p5").UID("p5").Obj()},
+			wantActive:        0,
+			wantBackoff:       0,
+			wantUnschedulable: 0,
+		},
+		{
+			name: "pod already in activeQ",
+			qPodInActiveQ:     []*v1.Pod{st.MakePod().Name("p6").UID("p6").Obj()},
+			qPodsToRequeue:    []*v1.Pod{st.MakePod().Name("p6").UID("p6").Obj()},
+			wantActive:        1,
+			wantBackoff:       0,
+			wantUnschedulable: 0,
+		},
+		{
+			name: "multiple pods mixed",
+			qPodInfoInUnschedulablePods: []*framework.QueuedPodInfo{
+				{
+					PodInfo:            mustNewPodInfo(st.MakePod().Name("p7").UID("p7").Obj()),
+					Timestamp:          time.Now().Add(-10 * time.Second),
+					UnschedulableCount: 1, // should be active
+				},
+			},
+			qPodInfoInBackoffQ: []*framework.QueuedPodInfo{
+				{
+					PodInfo:            mustNewPodInfo(st.MakePod().Name("p8").UID("p8").Obj()),
+					Timestamp:          time.Now(),
+					UnschedulableCount: 1, // should stay in backoff
+				},
+			},
+			qPodsToRequeue: []*v1.Pod{
+				st.MakePod().Name("p7").UID("p7").Obj(),
+				st.MakePod().Name("p8").UID("p8").Obj(),
+			},
+			wantActive:        1,
+			wantBackoff:       1,
+			wantUnschedulable: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logger, ctx := ktesting.NewTestContext(t)
+			q := NewTestQueue(ctx, newDefaultQueueSort())
+
+			for _, pInfo := range tt.qPodInfoInUnschedulablePods {
+				q.lock.Lock()
+				q.unschedulablePods.addOrUpdate(pInfo, false, "event")
+				q.lock.Unlock()
+			}
+			for _, pInfo := range tt.qPodInfoInBackoffQ {
+				q.lock.Lock()
+				q.backoffQ.add(logger, pInfo, "event")
+				q.lock.Unlock()
+			}
+			for _, pod := range tt.qPodInActiveQ {
+				q.Add(ctx, pod)
+			}
+
+			q.Requeue(logger, tt.qPodsToRequeue...)
+
+			if q.activeQ.len() != tt.wantActive {
+				t.Errorf("activeQ length: want %v, got %v", tt.wantActive, q.activeQ.len())
+			}
+			if q.backoffQ.len() != tt.wantBackoff {
+				t.Errorf("backoffQ length: want %v, got %v", tt.wantBackoff, q.backoffQ.len())
+			}
+			if len(q.unschedulablePods.podInfoMap) != tt.wantUnschedulable {
+				t.Errorf("unschedulablePods length: want %v, got %v", tt.wantUnschedulable, len(q.unschedulablePods.podInfoMap))
+			}
+		})
+	}
+}

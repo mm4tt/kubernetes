@@ -105,6 +105,9 @@ type SchedulingQueue interface {
 	// But, if a pod isn't found in unschedulablePods or backoffQ and it's not in-flight (i.e., completely unknown pod),
 	// Activate would ignore the pod.
 	Activate(logger klog.Logger, pods map[string]*v1.Pod)
+	// Requeue moves the given pods to activeQ or backoffQ.
+	// It's similar to Activate, but it honors backoff.
+	Requeue(logger klog.Logger, pods ...*v1.Pod)
 	// AddUnschedulableIfNotPresent adds an unschedulable pod back to scheduling queue.
 	// The podSchedulingCycle represents the current scheduling cycle number which can be
 	// returned by calling SchedulingCycle().
@@ -776,6 +779,54 @@ func (p *PriorityQueue) Activate(logger klog.Logger, pods map[string]*v1.Pod) {
 	if activated {
 		p.activeQ.broadcast()
 	}
+}
+
+// Requeue moves the given pods to activeQ or backoffQ.
+func (p *PriorityQueue) Requeue(logger klog.Logger, pods ...*v1.Pod) {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+
+	activated := false
+	for _, pod := range pods {
+		if p.requeue(logger, pod) {
+			activated = true
+		}
+	}
+
+	if activated {
+		p.activeQ.broadcast()
+	}
+}
+
+func (p *PriorityQueue) requeue(logger klog.Logger, pod *v1.Pod) bool {
+	var pInfo *framework.QueuedPodInfo
+	var movesFromBackoffQ bool
+	// Verify if the pod is present in unschedulablePods or backoffQ.
+	if pInfo = p.unschedulablePods.get(pod); pInfo == nil {
+		var exists bool
+		pInfo, exists = p.backoffQ.get(newQueuedPodInfoForLookup(pod))
+		if !exists {
+			return false
+		}
+		// Delete pod from the backoffQ now to make sure it won't be popped from the backoffQ
+		// just before moving it to the activeQ
+		if deleted := p.backoffQ.delete(pInfo); !deleted {
+			return false
+		}
+		movesFromBackoffQ = true
+	}
+
+	if pInfo == nil {
+		utilruntime.HandleErrorWithLogger(logger, nil, "Internal error: cannot obtain pInfo")
+		return false
+	}
+
+	// If the pod is backing off, move it to backoffQ.
+	if p.backoffQ.isPodBackingoff(pInfo) {
+		return p.moveToBackoffQ(logger, pInfo, "PodRequeued")
+	}
+
+	return p.moveToActiveQ(logger, pInfo, "PodRequeued", movesFromBackoffQ)
 }
 
 func (p *PriorityQueue) activate(logger klog.Logger, pod *v1.Pod) bool {
