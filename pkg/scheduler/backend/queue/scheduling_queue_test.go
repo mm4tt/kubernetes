@@ -1301,6 +1301,23 @@ func TestPriorityQueue_Update(t *testing.T) {
 			schedulingHintsEnablement: []bool{false, true},
 		},
 		{
+			name:  "Update pod that clears NominatedNodeName",
+			wantQ: activeQ,
+			prepareFunc: func(tCtx ktesting.TContext, q *PriorityQueue) (oldPod, newPod *v1.Pod) {
+				oldPodWithNominatedNodeName := medPriorityPodInfo.Pod.DeepCopy()
+				oldPodWithNominatedNodeName.Status.NominatedNodeName = "node1"
+				pInfo := q.newQueuedPodInfo(tCtx, oldPodWithNominatedNodeName, queuePlugin)
+				// needs to increment to make the pod backing off
+				pInfo.UnschedulableCount++
+				q.unschedulablePods.addOrUpdate(pInfo, false, framework.EventUnscheduledPodAdd.Label())
+
+				updatedPod := oldPodWithNominatedNodeName.DeepCopy()
+				updatedPod.Status.NominatedNodeName = ""
+				return oldPodWithNominatedNodeName, updatedPod
+			},
+			schedulingHintsEnablement: []bool{false, true},
+		},
+		{
 			name:                 "Update highPriorityPodInfo and add a nominatedNodeName to it",
 			wantQ:                activeQ,
 			wantAddedToNominated: true,
