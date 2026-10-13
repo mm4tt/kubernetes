@@ -26,6 +26,9 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
+	corev1helpers "k8s.io/component-helpers/scheduling/corev1"
+	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/names"
 	"k8s.io/kubernetes/pkg/scheduler/metrics"
 
@@ -196,9 +199,36 @@ func (ev *PodGroupEvaluator) selectVictimsOnDomain(
 	validAssignment := make([]fwk.ProposedAssignment, 0, len(podGroupAssignments.ProposedAssignments))
 
 	// Prepare podInfos for each of the assigned preemptor pods
+	preemptorUIDs := sets.New[types.UID]()
+	var preemptorPriority int32
 	for _, assignment := range podGroupAssignments.ProposedAssignments {
 		if assignment.GetNodeName() != "" {
 			validAssignment = append(validAssignment, assignment)
+			preemptorUIDs.Insert(assignment.GetPod().UID)
+			preemptorPriority = corev1helpers.PodPriority(assignment.GetPod())
+		}
+	}
+
+	// Ensure GE nominated pods (which were included in assignment.GetCycleState() during PreFilter)
+	// are also present in mutableLister during reprieveVictim evaluation.
+	allNodes, err := mutableLister.NodeInfos().List()
+	if err != nil {
+		return nil, fwk.AsStatus(err)
+	}
+	for _, ni := range allNodes {
+		nodeName := ni.Node().Name
+		for _, pi := range ev.Handle.NominatedPodsForNode(logger, nodeName) {
+			if corev1helpers.PodPriority(pi.GetPod()) >= preemptorPriority && !preemptorUIDs.Has(pi.GetPod().UID) {
+				podCopy := pi.GetPod().DeepCopy()
+				podCopy.Spec.NodeName = nodeName
+				clonedPI, err := framework.NewPodInfo(podCopy)
+				if err != nil {
+					return nil, fwk.AsStatus(err)
+				}
+				if err := mutableLister.AddPod(clonedPI, nodeName); err != nil {
+					return nil, fwk.AsStatus(err)
+				}
+			}
 		}
 	}
 

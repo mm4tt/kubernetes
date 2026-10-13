@@ -1291,39 +1291,41 @@ func (f *frameworkImpl) runPodGroupPostFilterPlugin(ctx context.Context, pl fwk.
 func (f *frameworkImpl) RunFilterPluginsWithNominatedPods(ctx context.Context, state fwk.CycleState, pod *v1.Pod, info fwk.NodeInfo) *fwk.Status {
 	var status *fwk.Status
 
-	podsAdded := false
-	// We run filters twice in some cases. If the node has greater or equal priority
-	// nominated pods, we run them when those pods are added to PreFilter state and nodeInfo.
-	// If all filters succeed in this pass, we run them again when these
-	// nominated pods are not added. This second pass is necessary because some
-	// filters such as inter-pod affinity may not pass without the nominated pods.
-	// If there are no nominated pods for the node or if the first run of the
-	// filters fail, we don't run the second pass.
-	// We consider only equal or higher priority pods in the first pass, because
-	// those are the current "pod" must yield to them and not take a space opened
-	// for running them. It is ok if the current "pod" take resources freed for
-	// lower priority pods.
-	// Requiring that the new pod is schedulable in both circumstances ensures that
-	// we are making a conservative decision: filters like resources and inter-pod
-	// anti-affinity are more likely to fail when the nominated pods are treated
-	// as running, while filters like pod affinity are more likely to fail when
-	// the nominated pods are treated as not running. We can't just assume the
-	// nominated pods are running because they are not running right now and in fact,
-	// they may end up getting scheduled to a different node.
 	logger := klog.FromContext(ctx)
 	logger = klog.LoggerWithName(logger, "FilterWithNominatedPods")
 	ctx = klog.NewContext(ctx, logger)
+
+	alreadyAssumedInSnapshot := hasAssumedGENominatedPods(ctx, f, pod, info)
+	podsModified := false
 	for i := 0; i < 2; i++ {
 		stateToUse := state
 		nodeInfoToUse := info
-		if i == 0 {
-			var err error
-			podsAdded, stateToUse, nodeInfoToUse, err = addGENominatedPods(ctx, f, pod, state, info)
-			if err != nil {
-				return fwk.AsStatus(err)
+		if alreadyAssumedInSnapshot {
+			// GE nominated pods were already assumed into the cluster snapshot before PreFilter.
+			// Pass 0 evaluates with them present; Pass 1 evaluates with node-local GE nominated pods removed.
+			if i == 1 {
+				if !status.IsSuccess() {
+					break
+				}
+				var err error
+				podsModified, stateToUse, nodeInfoToUse, err = removeGENominatedPods(ctx, f, pod, state, info)
+				if err != nil {
+					return fwk.AsStatus(err)
+				}
+				if !podsModified {
+					break
+				}
 			}
-		} else if !podsAdded || !status.IsSuccess() {
-			break
+		} else {
+			if i == 0 {
+				var err error
+				podsModified, stateToUse, nodeInfoToUse, err = addGENominatedPods(ctx, f, pod, state, info)
+				if err != nil {
+					return fwk.AsStatus(err)
+				}
+			} else if !podsModified || !status.IsSuccess() {
+				break
+			}
 		}
 
 		status = f.RunFilterPlugins(ctx, stateToUse, pod, nodeInfoToUse)
@@ -1333,6 +1335,66 @@ func (f *frameworkImpl) RunFilterPluginsWithNominatedPods(ctx context.Context, s
 	}
 
 	return status
+}
+
+func hasAssumedGENominatedPods(ctx context.Context, fh fwk.Handle, pod *v1.Pod, nodeInfo fwk.NodeInfo) bool {
+	if fh == nil || nodeInfo == nil || nodeInfo.Node() == nil {
+		return false
+	}
+	logger := klog.FromContext(ctx)
+	nominatedPodInfos := fh.NominatedPodsForNode(logger, nodeInfo.Node().Name)
+	if len(nominatedPodInfos) == 0 {
+		return false
+	}
+	existingUIDs := sets.New[types.UID]()
+	for _, existing := range nodeInfo.GetPods() {
+		existingUIDs.Insert(existing.GetPod().UID)
+	}
+	for _, pi := range nominatedPodInfos {
+		if corev1.PodPriority(pi.GetPod()) >= corev1.PodPriority(pod) && pi.GetPod().UID != pod.UID {
+			if existingUIDs.Has(pi.GetPod().UID) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func removeGENominatedPods(ctx context.Context, fh fwk.Handle, pod *v1.Pod, state fwk.CycleState, nodeInfo fwk.NodeInfo) (bool, fwk.CycleState, fwk.NodeInfo, error) {
+	if fh == nil {
+		return false, state, nodeInfo, nil
+	}
+	logger := klog.FromContext(ctx)
+	nominatedPodInfos := fh.NominatedPodsForNode(logger, nodeInfo.Node().Name)
+	if len(nominatedPodInfos) == 0 {
+		return false, state, nodeInfo, nil
+	}
+	nodeInfoOut := nodeInfo.Snapshot()
+	stateOut := state.Clone()
+	podsRemoved := false
+	for _, pi := range nominatedPodInfos {
+		if corev1.PodPriority(pi.GetPod()) >= corev1.PodPriority(pod) && pi.GetPod().UID != pod.UID {
+			var podToRemove fwk.PodInfo
+			for _, existing := range nodeInfoOut.GetPods() {
+				if existing.GetPod().UID == pi.GetPod().UID {
+					podToRemove = existing
+					break
+				}
+			}
+			if podToRemove == nil {
+				continue
+			}
+			if err := nodeInfoOut.RemovePod(logger, podToRemove.GetPod()); err != nil {
+				return false, state, nodeInfo, err
+			}
+			status := fh.RunPreFilterExtensionRemovePod(ctx, stateOut, pod, podToRemove, nodeInfoOut)
+			if !status.IsSuccess() {
+				return false, state, nodeInfo, status.AsError()
+			}
+			podsRemoved = true
+		}
+	}
+	return podsRemoved, stateOut, nodeInfoOut, nil
 }
 
 // addGENominatedPods adds pods with equal or greater priority which are nominated

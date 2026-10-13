@@ -260,6 +260,12 @@ func (sched *Scheduler) schedulingAlgorithm(
 	pod := podInfo.Pod
 
 	logger := klog.FromContext(ctx)
+	revertNominated, err := sched.algorithm.AssumeGENominatedPods(ctx, schedFramework, pod)
+	if err != nil {
+		return ScheduleResult{nominatingInfo: clearNominatedNode}, fwk.AsStatus(err)
+	}
+	defer revertNominated()
+
 	scheduleResult, err := sched.SchedulePod(ctx, schedFramework, state, podInfo)
 	if err != nil {
 		if err == ErrNoNodesAvailable {

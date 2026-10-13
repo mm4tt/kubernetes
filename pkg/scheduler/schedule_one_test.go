@@ -4188,6 +4188,81 @@ func TestFindFitPredicateCallCounts(t *testing.T) {
 	}
 }
 
+func TestCrossNodeNominatedPodProtection(t *testing.T) {
+	logger, ctx := ktesting.NewTestContext(t)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	nodes := []*v1.Node{
+		st.MakeNode().Name("node-zone1-a").Label("topology.kubernetes.io/zone", "zone1").Label("kubernetes.io/hostname", "node-zone1-a").Obj(),
+		st.MakeNode().Name("node-zone1-b").Label("topology.kubernetes.io/zone", "zone1").Label("kubernetes.io/hostname", "node-zone1-b").Obj(),
+		st.MakeNode().Name("node-zone2-a").Label("topology.kubernetes.io/zone", "zone2").Label("kubernetes.io/hostname", "node-zone2-a").Obj(),
+	}
+
+	// High-priority pod nominated on node-zone1-a with zone-scoped anti-affinity against app=conflict.
+	nominatedHighPod := st.MakePod().Name("high-nominated").Namespace("default").UID("high-nominated").
+		Priority(highPriority).
+		NominatedNodeName("node-zone1-a").
+		PodAntiAffinityExists("conflict", "topology.kubernetes.io/zone", st.PodAntiAffinityWithRequiredReq).
+		Obj()
+
+	// Lower-priority pod with label conflict=true that should not be scheduled into zone1
+	// because high-nominated has reserved zone1 via its nomination on node-zone1-a.
+	lowPod := st.MakePod().Name("low-pod").Namespace("default").UID("low-pod").
+		Priority(lowPriority).
+		Label("conflict", "").
+		Obj()
+
+	informerFactory := informers.NewSharedInformerFactory(clientsetfake.NewClientset(nominatedHighPod, lowPod), 0)
+	podInformer := informerFactory.Core().V1().Pods().Informer()
+	if err := podInformer.GetStore().Add(nominatedHighPod); err != nil {
+		t.Fatal(err)
+	}
+	if err := podInformer.GetStore().Add(lowPod); err != nil {
+		t.Fatal(err)
+	}
+
+	scheduler := makeScheduler(ctx, nodes)
+	if err := scheduler.Cache.UpdateSnapshot(logger, scheduler.nodeInfoSnapshot); err != nil {
+		t.Fatal(err)
+	}
+
+	registerPlugins := []tf.RegisterPluginFunc{
+		tf.RegisterQueueSortPlugin(queuesort.Name, queuesort.New),
+		tf.RegisterPluginAsExtensions(interpodaffinity.Name, frameworkruntime.FactoryAdapter(feature.Features{}, interpodaffinity.New), "PreFilter", "Filter"),
+		tf.RegisterBindPlugin(defaultbinder.Name, defaultbinder.New),
+	}
+	schedulingQueue := internalqueue.NewSchedulingQueue(nil, informerFactory)
+	schedulingQueue.Add(ctx, nominatedHighPod)
+	schedFramework, err := tf.NewFramework(
+		ctx,
+		registerPlugins, "",
+		frameworkruntime.WithPodNominator(schedulingQueue),
+		frameworkruntime.WithSnapshotSharedLister(scheduler.nodeInfoSnapshot),
+		frameworkruntime.WithInformerFactory(informerFactory),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	nominatedPodInfo, err := framework.NewPodInfo(nominatedHighPod)
+	if err != nil {
+		t.Fatal(err)
+	}
+	schedFramework.AddNominatedPod(logger, nominatedPodInfo, &fwk.NominatingInfo{
+		NominatingMode:    fwk.ModeOverride,
+		NominatedNodeName: "node-zone1-a",
+	})
+
+	res, err := scheduler.SchedulePod(ctx, schedFramework, framework.NewCycleState(), queuedPodInfoForPod(lowPod))
+	if err != nil {
+		t.Fatalf("unexpected scheduling error: %v", err)
+	}
+	if res.SuggestedHost != "node-zone2-a" {
+		t.Errorf("expected lowPod to be scheduled on node-zone2-a (outside zone1), got %q", res.SuggestedHost)
+	}
+}
+
 func Test_prioritizeNodes(t *testing.T) {
 	imageStatus1 := []v1.ContainerImage{
 		{

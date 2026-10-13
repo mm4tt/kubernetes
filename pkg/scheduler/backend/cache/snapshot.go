@@ -164,6 +164,10 @@ type assumedPodState struct {
 	// If the InterPodAffinityHostnameFastPath feature gate is enabled, it tracks updates to
 	// havePodsWithRequiredNonHostScopedAntiAffinityNodeInfoList. If disabled, it's always false.
 	addedToNonHostScopedAntiAffinityList bool
+	// updatePodGroupState is true when AssumePod updated podGroupStates and
+	// ForgetPod needs to revert that update. False for nominated pods assumed
+	// into the snapshot for PreFilter/Filter evaluation.
+	updatePodGroupState bool
 }
 
 // NewEmptySnapshot initializes a Snapshot struct and returns it.
@@ -542,6 +546,43 @@ func (s *Snapshot) IsPVCUsedByPods(key string) bool {
 // ForgetPod should be called on the snapshot before syncing it with the cache.
 // This function is not thread safe, so it should be executed when no other routines can write/read from the snapshot.
 func (s *Snapshot) AssumePod(podInfo *framework.PodInfo) error {
+	return s.assumePod(podInfo, true)
+}
+
+// AssumeNominatedPod assumes a nominated pod on its nominated node in the snapshot
+// without marking it as scheduled in PodGroupState. If the nominated node does not
+// exist in the snapshot or the pod is already present on the node, it returns (nil, nil).
+func (s *Snapshot) AssumeNominatedPod(podInfo fwk.PodInfo, nodeName string) (*v1.Pod, error) {
+	nodeInfo, ok := s.nodeInfoMap[nodeName]
+	if !ok || nodeInfo.Node() == nil {
+		return nil, nil
+	}
+	origPod := podInfo.GetPod()
+	key, err := framework.GetPodKey(origPod)
+	if err != nil {
+		return nil, err
+	}
+	if _, alreadyAssumed := s.assumedPodStates[key]; alreadyAssumed {
+		return nil, nil
+	}
+	for _, existing := range nodeInfo.Pods {
+		if existing.GetPod().UID == origPod.UID {
+			return nil, nil
+		}
+	}
+	podCopy := origPod.DeepCopy()
+	podCopy.Spec.NodeName = nodeName
+	clonedPodInfo, err := framework.NewPodInfo(podCopy)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.assumePod(clonedPodInfo, false); err != nil {
+		return nil, err
+	}
+	return podCopy, nil
+}
+
+func (s *Snapshot) assumePod(podInfo *framework.PodInfo, updatePodGroupState bool) error {
 	pod := podInfo.Pod
 	key, err := framework.GetPodKey(pod)
 	if err != nil {
@@ -564,7 +605,7 @@ func (s *Snapshot) AssumePod(podInfo *framework.PodInfo) error {
 	// nodeInfo.AddPodInfo maintains the NodeInfo's affinity and PVC indexes;
 	// the snapshot-wide indexes must be updated to match, otherwise inter-pod
 	// (anti-)affinity and VolumeRestrictions plugins observe stale state.
-	state := &assumedPodState{pod: pod}
+	state := &assumedPodState{pod: pod, updatePodGroupState: updatePodGroupState}
 	if !hadPodsWithAffinity && len(nodeInfo.PodsWithAffinity) > 0 {
 		s.havePodsWithAffinityNodeInfoList = append(s.havePodsWithAffinityNodeInfoList, nodeInfo)
 		state.addedToAffinityList = true
@@ -583,7 +624,7 @@ func (s *Snapshot) AssumePod(podInfo *framework.PodInfo) error {
 	s.assumedPodStates[key] = state
 	s.assumedPodKeys = append(s.assumedPodKeys, key)
 	// Update the pod group state in the snapshot if the pod belongs to a pod group.
-	if !s.genericWorkloadEnabled || pod.Spec.SchedulingGroup == nil {
+	if !updatePodGroupState || !s.genericWorkloadEnabled || pod.Spec.SchedulingGroup == nil {
 		return nil
 	}
 	pgKey := fwk.PodGroupKey(pod.Namespace, *pod.Spec.SchedulingGroup.PodGroupName)
@@ -654,7 +695,7 @@ func (s *Snapshot) ForgetPod(logger klog.Logger, pod *v1.Pod) error {
 		}
 	}
 	// Update the pod group state in the snapshot if the pod belongs to a pod group.
-	if !s.genericWorkloadEnabled || pod.Spec.SchedulingGroup == nil {
+	if !state.updatePodGroupState || !s.genericWorkloadEnabled || pod.Spec.SchedulingGroup == nil {
 		return nil
 	}
 	pgKey := fwk.PodGroupKey(assumedPod.Namespace, *assumedPod.Spec.SchedulingGroup.PodGroupName)

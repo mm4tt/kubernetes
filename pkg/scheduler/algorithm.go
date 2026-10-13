@@ -27,6 +27,7 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	corev1helpers "k8s.io/component-helpers/scheduling/corev1"
 	"k8s.io/klog/v2"
 	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/features"
@@ -137,6 +138,46 @@ func (a *SchedulingAlgorithm) opportunisticBatchingEnabled() bool {
 	return a.cycleProvider != nil && utilfeature.DefaultFeatureGate.Enabled(features.OpportunisticBatching)
 }
 
+// AssumeGENominatedPods assumes all nominated pods across the cluster with priority
+// greater than or equal to pod into the node snapshot. It returns a revert function
+// that forgets the assumed nominated pods in reverse order.
+func (a *SchedulingAlgorithm) AssumeGENominatedPods(ctx context.Context, schedFramework framework.Framework, pod *v1.Pod) (func(), error) {
+	if schedFramework == nil {
+		return func() {}, nil
+	}
+	logger := klog.FromContext(ctx)
+	allNodes, err := a.nodeInfoSnapshot.List()
+	if err != nil {
+		return func() {}, err
+	}
+	podPriority := corev1helpers.PodPriority(pod)
+	var assumedPods []*v1.Pod
+	revert := func() {
+		for i := len(assumedPods) - 1; i >= 0; i-- {
+			if forgetErr := a.nodeInfoSnapshot.ForgetPod(logger, assumedPods[i]); forgetErr != nil {
+				utilruntime.HandleErrorWithContext(ctx, forgetErr, "Failed to forget nominated pod from snapshot", "pod", klog.KObj(assumedPods[i]))
+			}
+		}
+	}
+	for _, nodeInfo := range allNodes {
+		nodeName := nodeInfo.Node().Name
+		nominatedPodInfos := schedFramework.NominatedPodsForNode(logger, nodeName)
+		for _, pi := range nominatedPodInfos {
+			if corev1helpers.PodPriority(pi.GetPod()) >= podPriority && pi.GetPod().UID != pod.UID {
+				assumedPod, err := a.nodeInfoSnapshot.AssumeNominatedPod(pi, nodeName)
+				if err != nil {
+					revert()
+					return func() {}, err
+				}
+				if assumedPod != nil {
+					assumedPods = append(assumedPods, assumedPod)
+				}
+			}
+		}
+	}
+	return revert, nil
+}
+
 // SchedulePod runs PreFilter, Filter, filter extenders and Score, and returns the
 // selected node. It returns a *framework.FitError when no node fits — running
 // PostFilter (preemption) and requeueing in response is the caller's job:
@@ -149,6 +190,12 @@ func (a *SchedulingAlgorithm) SchedulePod(ctx context.Context, schedFramework fr
 	if a.nodeInfoSnapshot.NumNodesInPlacement() == 0 {
 		return result, ErrNoNodesAvailable
 	}
+
+	revertNominated, err := a.AssumeGENominatedPods(ctx, schedFramework, pod)
+	if err != nil {
+		return result, err
+	}
+	defer revertNominated()
 
 	feasibleNodes, diagnosis, nodeHint, err := a.findNodesThatFitPod(ctx, schedFramework, state, podInfo)
 	if err != nil {
@@ -590,6 +637,11 @@ func (a *SchedulingAlgorithm) reserve(ctx context.Context, state fwk.CycleState,
 // so callers inspecting cluster capacity or running custom batching receive exhaustive results.
 func (a *SchedulingAlgorithm) FindAllNodesThatFitPod(ctx context.Context, state fwk.CycleState, schedFramework framework.Framework, podInfo *framework.QueuedPodInfo) ([]fwk.NodeInfo, *framework.Diagnosis, error) {
 	pod := podInfo.Pod
+	revertNominated, err := a.AssumeGENominatedPods(ctx, schedFramework, pod)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer revertNominated()
 	preFilterOutcome, status := a.prefilterNodes(ctx, schedFramework, state, pod)
 	diagnosis := preFilterOutcome.diagnosis
 	if !status.IsSuccess() {
